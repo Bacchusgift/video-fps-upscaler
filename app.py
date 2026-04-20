@@ -3,7 +3,7 @@ import subprocess
 import tempfile
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, HttpUrl
@@ -62,6 +62,76 @@ async def convert_video(req: ConvertRequest):
 
     # Run ffmpeg minterpolate
     vf = f"minterpolate='fps={req.target_fps}:mi_mode={mi_mode}'"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-an",
+        output_path,
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+    except (subprocess.TimeoutExpired, RuntimeError) as e:
+        _cleanup(tmp_dir)
+        detail = str(e)[-500:] if str(e) else "ffmpeg timed out"
+        raise HTTPException(status_code=500, detail=f"ffmpeg failed: {detail}")
+
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        _cleanup(tmp_dir)
+        raise HTTPException(status_code=500, detail="ffmpeg produced no output")
+
+    content_type = CONTENT_TYPES[fmt]
+
+    def iter_file():
+        with open(output_path, "rb") as f:
+            while chunk := f.read(64 * 1024):
+                yield chunk
+
+    return StreamingResponse(
+        iter_file(),
+        media_type=content_type,
+        headers={"Content-Disposition": f"attachment; filename=output.{fmt}"},
+        background=BackgroundTask(_cleanup, tmp_dir),
+    )
+
+
+@app.post("/convert/upload")
+async def convert_upload(
+    file: UploadFile = File(...),
+    output_format: str = Query("mp4"),
+    target_fps: int = Query(24),
+    minterpolate_mode: str = Query("mci"),
+):
+    fmt = output_format.lower()
+    if fmt not in ALLOWED_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported output format: {fmt}. Allowed: {', '.join(sorted(ALLOWED_FORMATS))}",
+        )
+
+    mi_mode = minterpolate_mode.lower()
+    if mi_mode not in ALLOWED_MI_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported minterpolate mode: {mi_mode}. Allowed: {', '.join(sorted(ALLOWED_MI_MODES))}",
+        )
+
+    tmp_dir = tempfile.mkdtemp()
+    input_path = os.path.join(tmp_dir, f"input.{fmt}")
+    output_path = os.path.join(tmp_dir, f"output.{fmt}")
+
+    content = await file.read()
+    if not content:
+        _cleanup(tmp_dir)
+        raise HTTPException(status_code=400, detail="Empty file")
+    with open(input_path, "wb") as f:
+        f.write(content)
+
+    vf = f"minterpolate='fps={target_fps}:mi_mode={mi_mode}'"
     cmd = [
         "ffmpeg", "-y",
         "-i", input_path,
