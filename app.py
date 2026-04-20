@@ -60,15 +60,16 @@ async def convert_video(req: ConvertRequest):
         _cleanup(tmp_dir)
         raise HTTPException(status_code=400, detail=f"Failed to download video: {e}")
 
-    # Run ffmpeg minterpolate
-    vf = f"minterpolate='fps={req.target_fps}:mi_mode={mi_mode}'"
+    # Run ffmpeg minterpolate with setpts to preserve duration
+    vf = (
+        f"minterpolate='fps={req.target_fps}:mi_mode={mi_mode}',"
+        f"setpts=N/{req.target_fps}/TB"
+    )
     cmd = [
         "ffmpeg", "-y",
-        "-r", str(req.source_fps),
         "-i", input_path,
         "-vf", vf,
         "-c:v", "libx264",
-        "-r", str(req.target_fps),
         "-vsync", "cfr",
         "-an",
         output_path,
@@ -135,14 +136,15 @@ async def convert_upload(
     with open(input_path, "wb") as f:
         f.write(content)
 
-    vf = f"minterpolate='fps={target_fps}:mi_mode={mi_mode}'"
+    vf = (
+        f"minterpolate='fps={target_fps}:mi_mode={mi_mode}',"
+        f"setpts=N/{target_fps}/TB"
+    )
     cmd = [
         "ffmpeg", "-y",
-        "-r", str(source_fps),
         "-i", input_path,
         "-vf", vf,
         "-c:v", "libx264",
-        "-r", str(target_fps),
         "-vsync", "cfr",
         "-an",
         output_path,
