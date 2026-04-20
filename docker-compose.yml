@@ -2,5 +2,5 @@ services:
   fps-upgrade:
     build: .
     ports:
-      - "8000:8000"
+      - "8001:8000"
     restart: unless-stopped
