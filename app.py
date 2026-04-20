@@ -64,9 +64,12 @@ async def convert_video(req: ConvertRequest):
     vf = f"minterpolate='fps={req.target_fps}:mi_mode={mi_mode}'"
     cmd = [
         "ffmpeg", "-y",
+        "-r", str(req.source_fps),
         "-i", input_path,
         "-vf", vf,
         "-c:v", "libx264",
+        "-r", str(req.target_fps),
+        "-vsync", "cfr",
         "-an",
         output_path,
     ]
@@ -103,6 +106,7 @@ async def convert_video(req: ConvertRequest):
 async def convert_upload(
     file: UploadFile = File(...),
     output_format: str = Query("mp4"),
+    source_fps: int = Query(16),
     target_fps: int = Query(24),
     minterpolate_mode: str = Query("mci"),
 ):
@@ -134,9 +138,12 @@ async def convert_upload(
     vf = f"minterpolate='fps={target_fps}:mi_mode={mi_mode}'"
     cmd = [
         "ffmpeg", "-y",
+        "-r", str(source_fps),
         "-i", input_path,
         "-vf", vf,
         "-c:v", "libx264",
+        "-r", str(target_fps),
+        "-vsync", "cfr",
         "-an",
         output_path,
     ]
