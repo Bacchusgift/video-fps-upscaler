@@ -1,4 +1,5 @@
 import os
+import math
 import subprocess
 import uuid
 
@@ -47,6 +48,44 @@ def _run_ffmpeg(cmd: list[str], cleanup_dir: str | None = None):
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {detail}")
 
 
+def _probe_duration(path: str) -> float:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True, timeout=30,
+    )
+    if probe.returncode != 0:
+        raise HTTPException(status_code=500, detail="ffprobe failed")
+    try:
+        duration = float(probe.stdout.strip())
+    except ValueError:
+        raise HTTPException(status_code=500, detail="Cannot determine video duration")
+    if duration <= 0:
+        raise HTTPException(status_code=400, detail="Invalid video duration")
+    return duration
+
+
+def _validate_fps(source_fps: int, target_fps: int):
+    if source_fps <= 0 or target_fps <= 0:
+        raise HTTPException(status_code=400, detail="FPS values must be positive")
+
+
+def _convert_with_interpolation(input_path: str, output_path: str, target_fps: int, mi_mode: str):
+    duration = _probe_duration(input_path)
+    duration_arg = f"{duration:.6f}"
+    vf = (
+        f"minterpolate='fps={target_fps}:mi_mode={mi_mode}',"
+        "setpts=PTS-STARTPTS,"
+        f"tpad=stop_mode=clone:stop_duration={duration_arg},"
+        f"trim=duration={duration_arg},"
+        f"fps={target_fps}"
+    )
+    _run_ffmpeg(
+        ["ffmpeg", "-y", "-i", input_path, "-vf", vf,
+         "-c:v", "libx264", "-an", output_path],
+    )
+
+
 async def _download(url: str, dest: str):
     try:
         async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
@@ -85,6 +124,7 @@ async def convert_video(req: ConvertRequest):
     mi_mode = req.minterpolate_mode.lower()
     if mi_mode not in ALLOWED_MI_MODES:
         raise HTTPException(status_code=400, detail=f"Unsupported mode: {mi_mode}")
+    _validate_fps(req.source_fps, req.target_fps)
 
     task_id, task_dir = _new_task_dir()
     input_path = os.path.join(task_dir, f"input.{fmt}")
@@ -92,11 +132,7 @@ async def convert_video(req: ConvertRequest):
 
     await _download(str(req.url), input_path)
 
-    vf = f"minterpolate='fps={req.target_fps}:mi_mode={mi_mode}',setpts=N/{req.target_fps}/TB"
-    _run_ffmpeg(
-        ["ffmpeg", "-y", "-i", input_path, "-vf", vf,
-         "-c:v", "libx264", "-vsync", "cfr", "-an", output_path],
-    )
+    _convert_with_interpolation(input_path, output_path, req.target_fps, mi_mode)
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         raise HTTPException(status_code=500, detail="ffmpeg produced no output")
@@ -120,6 +156,7 @@ async def convert_upload(
     mi_mode = minterpolate_mode.lower()
     if mi_mode not in ALLOWED_MI_MODES:
         raise HTTPException(status_code=400, detail=f"Unsupported mode: {mi_mode}")
+    _validate_fps(source_fps, target_fps)
 
     task_id, task_dir = _new_task_dir()
     input_path = os.path.join(task_dir, f"input.{fmt}")
@@ -131,11 +168,7 @@ async def convert_upload(
     with open(input_path, "wb") as f:
         f.write(content)
 
-    vf = f"minterpolate='fps={target_fps}:mi_mode={mi_mode}',setpts=N/{target_fps}/TB"
-    _run_ffmpeg(
-        ["ffmpeg", "-y", "-i", input_path, "-vf", vf,
-         "-c:v", "libx264", "-vsync", "cfr", "-an", output_path],
-    )
+    _convert_with_interpolation(input_path, output_path, target_fps, mi_mode)
 
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         raise HTTPException(status_code=500, detail="ffmpeg produced no output")
@@ -161,35 +194,32 @@ async def split_video(req: SplitRequest):
     input_path = os.path.join(task_dir, f"input.{fmt}")
     await _download(str(req.url), input_path)
 
-    # probe duration
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-        capture_output=True, text=True, timeout=30,
-    )
-    if probe.returncode != 0:
-        raise HTTPException(status_code=500, detail="ffprobe failed")
-    try:
-        total_duration = float(probe.stdout.strip())
-    except ValueError:
-        raise HTTPException(status_code=500, detail="Cannot determine video duration")
+    total_duration = _probe_duration(input_path)
 
     dur = req.segment_duration
-    num_segments = max(int(total_duration // dur), 1)
+    if dur <= 0:
+        raise HTTPException(status_code=400, detail="segment_duration must be positive")
+    num_segments = max(math.ceil(total_duration / dur), 1)
 
+    segments: list[str] = []
     for i in range(num_segments):
         start = i * dur
+        segment_duration = min(dur, total_duration - start)
+        if segment_duration <= 0:
+            continue
         seg_path = os.path.join(task_dir, f"segment_{i}.{fmt}")
         _run_ffmpeg([
-            "ffmpeg", "-y", "-ss", str(start),
-            "-i", input_path, "-t", str(dur),
+            "ffmpeg", "-y", "-i", input_path,
+            "-ss", f"{start:.6f}", "-t", f"{segment_duration:.6f}",
+            "-vf", "setpts=PTS-STARTPTS",
             "-c:v", "libx264", "-an", seg_path,
         ])
+        segments.append(f"storage/{task_id}/segment_{i}.{fmt}")
 
     return {
         "task_id": task_id,
-        "segments": [f"storage/{task_id}/segment_{i}.{fmt}" for i in range(num_segments)],
-        "total_segments": num_segments,
+        "segments": segments,
+        "total_segments": len(segments),
     }
 
 
